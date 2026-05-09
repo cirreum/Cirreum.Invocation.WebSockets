@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<RootNamespace>Cirreum.Invocation</RootNamespace>
+		<Description>WebSocket invocation source for the Cirreum framework — transport adapter that publishes IInvocationContext per WebSocket frame, materializes IInvocationConnection per connection, dispatches IConnectionLifecycle callbacks, and provides IConnectionSender for server-initiated push.</Description>
+		<PackageTags>cirreum;invocation;websocket;providers</PackageTags>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<FrameworkReference Include="Microsoft.AspNetCore.App" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<PackageReference Include="Cirreum.InvocationProvider" Version="1.2.0" />
+	</ItemGroup>
+
+</Project>
