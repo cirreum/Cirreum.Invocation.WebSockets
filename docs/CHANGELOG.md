@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-05-09
+
 ### Added
 
 - **`IWebSocketConnection`** (public, `Cirreum.Invocation.WebSockets`) — WebSocket-specific extension of `IInvocationConnection` that exposes the frame-level send primitive `SendBytesAsync(ReadOnlyMemory<byte>, WebSocketMessageType, CT)`. Implemented by the framework's internal `WebSocketConnection`. Inside a handler, no cast is needed — `WebSocketHandler.Connection` is typed as `IWebSocketConnection` directly, so handlers call `this.Connection.SendBytesAsync(...)` straight away. Cross-cutting code reaching the connection through the L2 `IInvocationContextAccessor` does need to downcast (`accessor.Current?.Connection is IWebSocketConnection ws`) — the L2 accessor is transport-neutral by design, so the downcast is the explicit "I am committed to WebSocket-specific behavior" acknowledgment. Use for raw frame writes — binary protocols, audio/video chunks, pre-serialized payloads — that bypass JSON serialization entirely. Transport-substitutable code stays on the base `IInvocationConnection.SendAsync` overloads.

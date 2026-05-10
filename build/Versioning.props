@@ -5,7 +5,7 @@
 
 		<!-- Default version components (used when Version is not passed externally) -->
 		<MajorProductVersion Condition="'$(MajorProductVersion)' == ''">1</MajorProductVersion>
-		<MinorProductVersion Condition="'$(MinorProductVersion)' == ''">1</MinorProductVersion>
+		<MinorProductVersion Condition="'$(MinorProductVersion)' == ''">2</MinorProductVersion>
 		<PatchProductVersion Condition="'$(PatchProductVersion)' == ''">0</PatchProductVersion>
 
 		<!-- Build VersionPrefix from components if not set -->
