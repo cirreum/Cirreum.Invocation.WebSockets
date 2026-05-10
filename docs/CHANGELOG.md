@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-05-10
+
 ### Fixed
 
 - **Auth slots now propagate from the upgrade-time `HttpContext` onto `WebSocketConnection.Items` and per-message `IInvocationContext.Items`** — closes a real defect where `IUserStateAccessor` (and any other consumer of `AuthenticationContextKeys.AuthenticatedScheme` / `ApplicationUserCache`) saw an empty per-invocation `Items` bag on every inbound message, causing the `IApplicationUserResolver` to be re-invoked per invocation (IdP hammering for audience-auth long-lived connections). Two coordinated changes to land the fix:
