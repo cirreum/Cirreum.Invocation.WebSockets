@@ -54,6 +54,12 @@ internal sealed partial class WebSocketOrchestrator(
 		WebSocketInvocationInstanceSettings settings,
 		CancellationToken cancellationToken) {
 
+		if (!httpContext.WebSockets.IsWebSocketRequest) {
+			logger.LogWarning("Non-WebSocket request.");
+			httpContext.Response.StatusCode = 400;
+			return;
+		}
+
 		// Create a connection-scoped DI scope for the handler's lifetime.
 		await using var connectionScope = scopeFactory.CreateAsyncScope();
 		var handler = (WebSocketHandler)connectionScope.ServiceProvider.GetRequiredService(handlerType);
@@ -65,11 +71,6 @@ internal sealed partial class WebSocketOrchestrator(
 				httpContext.Response.StatusCode = StatusCodes.Status400BadRequest;
 			}
 			LogPreAcceptRejected(logger, handlerType.Name, httpContext.Request.Path);
-			return;
-		}
-
-		if (!httpContext.WebSockets.IsWebSocketRequest) {
-			httpContext.Response.StatusCode = StatusCodes.Status400BadRequest;
 			return;
 		}
 
@@ -102,12 +103,27 @@ internal sealed partial class WebSocketOrchestrator(
 			connectionLogger,
 			cancellationToken);
 
-		var address = httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+		var address = httpContext.Connection.RemoteIpAddress?.MapToIPv4().ToString() ?? "unknown";
 		LogConnectionAccepted(logger, connectionId, handlerType.Name, address);
 
 		// Copy UpgradeItems into Connection.Items.
 		foreach (var kvp in handler.UpgradeItems) {
 			connection.Items[kvp.Key] = kvp.Value;
+		}
+
+		// Copy well-known authentication slots from the upgrade-time HttpContext.Items onto
+		// Connection.Items so the connection-lifetime bag carries the auth context that the
+		// HTTP middleware established for this connection's upgrade request. The forward
+		// selector always stamps AuthenticatedScheme; the audience-auth claims transformer
+		// stamps ApplicationUserCache when an IApplicationUserResolver matches. Per-message
+		// WebSocketInvocationContext construction seeds per-invocation Items from these slots,
+		// so consumers like UserStateAccessor read uniformly across HTTP and WebSocket without
+		// hitting the IdP on every inbound message. See ADR-0002 transport-adapter invariant #2.
+		if (httpContext.Items.TryGetValue(AuthenticationContextKeys.AuthenticatedScheme, out var scheme)) {
+			connection.Items[AuthenticationContextKeys.AuthenticatedScheme] = scheme;
+		}
+		if (httpContext.Items.TryGetValue(AuthenticationContextKeys.ApplicationUserCache, out var appUser)) {
+			connection.Items[AuthenticationContextKeys.ApplicationUserCache] = appUser;
 		}
 
 		// Give the handler a reference to its connection and the negotiated subprotocol.

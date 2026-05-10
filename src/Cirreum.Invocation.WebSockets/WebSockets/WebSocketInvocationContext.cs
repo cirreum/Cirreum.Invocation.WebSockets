@@ -17,6 +17,16 @@ using System.Security.Claims;
 /// <c>Connection.Items</c>, not here.
 /// </para>
 /// <para>
+/// At construction, the framework seeds the per-invocation bag with the well-known
+/// authentication slots (<c>AuthenticatedScheme</c>, <c>ApplicationUserCache</c>) from
+/// <c>Connection.Items</c> so consumers like <c>UserStateAccessor</c> read uniformly
+/// across HTTP and WebSocket without re-resolving the application user on every inbound
+/// message. The seed is a snapshot copy — per-invocation writes do NOT propagate back to
+/// <c>Connection.Items</c> (per-message state isolation; ADR-0002 invariant #6). The
+/// connection-lifetime values were placed onto <c>Connection.Items</c> at upgrade by
+/// <see cref="WebSocketOrchestrator.HandleWebSocketAsync"/>.
+/// </para>
+/// <para>
 /// Used both for in-flight message invocations (via the WebSocket middleware's frame loop)
 /// and for synthetic invocation scopes around connection lifecycle hooks
 /// (<c>OnConnectedAsync</c> / <c>OnDisconnectedAsync</c>) so consumers like
@@ -60,11 +70,12 @@ internal sealed class WebSocketInvocationContext : IInvocationContext {
 		this.Services = services;
 		this.Aborted = aborted;
 		this.Connection = connection;
+		this.Items = SeedAuthSlots(connection);
 	}
 
 	public ClaimsPrincipal User { get; }
 
-	public IDictionary<object, object?> Items { get; } = new Dictionary<object, object?>();
+	public IDictionary<object, object?> Items { get; }
 
 	public IServiceProvider Services { get; }
 
@@ -73,5 +84,24 @@ internal sealed class WebSocketInvocationContext : IInvocationContext {
 	public string InvocationSource => InvocationSources.WebSocket;
 
 	public IInvocationConnection? Connection { get; }
+
+	private static Dictionary<object, object?> SeedAuthSlots(WebSocketConnection connection) {
+
+		// Per-invocation Items starts as a fresh dictionary, seeded with the well-known
+		// authentication slots from Connection.Items. These are connection-lifetime values
+		// (the same authenticated identity owns the entire connection); seeding them
+		// per-invocation lets UserStateAccessor and other consumers read invocation.Items
+		// without needing to know about Connection.Items. App per-message writes to
+		// invocation.Items don't propagate back to Connection.Items (separate dicts) —
+		// per-message isolation per ADR-0002 invariant #6.
+		var dict = new Dictionary<object, object?>();
+		if (connection.Items.TryGetValue(AuthenticationContextKeys.AuthenticatedScheme, out var scheme)) {
+			dict[AuthenticationContextKeys.AuthenticatedScheme] = scheme;
+		}
+		if (connection.Items.TryGetValue(AuthenticationContextKeys.ApplicationUserCache, out var appUser)) {
+			dict[AuthenticationContextKeys.ApplicationUserCache] = appUser;
+		}
+		return dict;
+	}
 
 }
