@@ -180,25 +180,33 @@ internal sealed partial class WebSocketOrchestrator(
 		WebSocketHandler handler,
 		WebSocketInvocationInstanceSettings settings) {
 
-		var buffer = ArrayPool<byte>.Shared.Rent(settings.ReceiveBufferSizeBytes);
-		try {
-			using var messageBuffer = new MemoryStream();
+		// Receive buffer — pooled per-connection, fixed size (configurable per instance).
+		var receiveBuffer = ArrayPool<byte>.Shared.Rent(settings.ReceiveBufferSizeBytes);
 
+		// Message accumulator — write-only buffer that grows as multi-frame messages
+		// are stitched together. ArrayBufferWriter<byte> is purpose-built for this:
+		// fewer fields touched per Write than MemoryStream, and WrittenMemory is a
+		// borrowed view (no per-message allocation) that we hand straight to
+		// OnMessageAsync. Reset via Clear() between messages — keeps the internal
+		// array; just resets WrittenCount to 0.
+		var messageBuffer = new ArrayBufferWriter<byte>(settings.ReceiveBufferSizeBytes);
+
+		try {
 			while (connection.WebSocket.State == WebSocketState.Open
 				&& !connection.Aborted.IsCancellationRequested) {
 
 				var result = await connection.WebSocket.ReceiveAsync(
-					buffer.AsMemory(),
+					receiveBuffer.AsMemory(),
 					connection.Aborted);
 
 				if (result.MessageType == WebSocketMessageType.Close) {
 					break;
 				}
 
-				messageBuffer.Write(buffer, 0, result.Count);
+				messageBuffer.Write(receiveBuffer.AsSpan(0, result.Count));
 
-				if (messageBuffer.Length > settings.MaxMessageSizeBytes) {
-					LogMessageSizeExceeded(logger, connection.ConnectionId, messageBuffer.Length, settings.MaxMessageSizeBytes);
+				if (messageBuffer.WrittenCount > settings.MaxMessageSizeBytes) {
+					LogMessageSizeExceeded(logger, connection.ConnectionId, messageBuffer.WrittenCount, settings.MaxMessageSizeBytes);
 					await connection.WebSocket.CloseAsync(
 						WebSocketCloseStatus.MessageTooBig,
 						"Message exceeds maximum size",
@@ -210,17 +218,20 @@ internal sealed partial class WebSocketOrchestrator(
 					continue;
 				}
 
-				var messageBytes = messageBuffer.ToArray();
-				messageBuffer.SetLength(0);
-
+				// Borrow semantics: hand WrittenMemory to the handler. Valid for the
+				// duration of the awaited DispatchMessageAsync; after it returns,
+				// Clear() resets WrittenCount and the same backing array is reused.
+				// Handlers that need to retain the bytes copy in OnMessageAsync.
 				await this.DispatchMessageAsync(
 					connection,
 					handler,
-					messageBytes.AsMemory(),
+					messageBuffer.WrittenMemory,
 					result.MessageType);
+
+				messageBuffer.Clear();
 			}
 		} finally {
-			ArrayPool<byte>.Shared.Return(buffer);
+			ArrayPool<byte>.Shared.Return(receiveBuffer);
 		}
 	}
 

@@ -40,7 +40,7 @@ L5 Runtime Extensions
 
 | Type | Role |
 |---|---|
-| `WebSocketHandler` (`Cirreum.Invocation.WebSockets`) | Public abstract base class for app-defined message handlers — lifecycle hooks `OnAcceptAsync`, `OnSelectSubProtocolAsync`, `OnConnectedAsync`, `OnMessageAsync(IInvocationContext, ...)`, `OnDisconnectedAsync(DisconnectInfo, CancellationToken)`. Resolved as scoped — one instance per connection |
+| `WebSocketHandler` (`Cirreum.Invocation.WebSockets`) | Public abstract base class for app-defined message handlers — lifecycle hooks `OnAcceptAsync`, `OnSelectSubProtocolAsync`, `OnConnectedAsync`, `OnMessageAsync(IInvocationContext, ...)`, `OnDisconnectedAsync(DisconnectInfo, CancellationToken)`. Three handler-bound `SendAsync` overloads (typed JSON, method-envelope JSON, raw bytes) push to the calling client without depending on the ambient `IInvocationContextAccessor`. Resolved as scoped — one instance per connection |
 | `IWebSocketUrlBuilder` (`Cirreum.Invocation.WebSockets`) | Public helper for constructing absolute `wss://` URLs with auto-extracted route values from `RouteValues`, `Query`, and `Form` — implicit instance resolution via endpoint metadata when used inside a request endpoint, explicit overload otherwise |
 | `WebSocketInvocationRegistrar` (`Cirreum.Invocation`) | Concrete registrar — wires the orchestrator, registers `IConnectionSender`, registers `IWebSocketUrlBuilder`, validates settings + hard caps, maps WebSocket and request endpoints with method default and authorization scheme |
 | `WebSocketInvocationSettings` / `WebSocketInvocationInstanceSettings` (`Cirreum.Invocation.Configuration`) | Typed settings bound from `Cirreum:Invocation:Providers:WebSocket` — `Path`, `RequestPath`, `Scheme`, `Enabled`, `DisconnectTimeoutSeconds`, `MaxMessageSizeBytes`, `ReceiveBufferSizeBytes`, `KeepAliveInterval`, `KeepAliveTimeout` |
@@ -143,13 +143,49 @@ public abstract class WebSocketHandler {
     public string? SubProtocol { get; internal set; }
     protected internal IDictionary<object, object?> UpgradeItems { get; }
 
+    // Lifecycle hooks
     public virtual Task<bool> OnAcceptAsync(HttpContext context);
     public virtual Task<string?> OnSelectSubProtocolAsync(HttpContext context);
     public virtual Task OnConnectedAsync(CancellationToken cancellationToken);
     public abstract Task OnMessageAsync(IInvocationContext context, ReadOnlyMemory<byte> message, WebSocketMessageType messageType);
     public virtual Task OnDisconnectedAsync(DisconnectInfo info, CancellationToken cancellationToken);
 
+    // Handler-bound push (resolves through this.Connection — no accessor required).
+    // Typed overloads send `Text` frames; raw-bytes overload defaults to `Binary`.
+    protected ValueTask SendAsync<T>(T payload, CancellationToken cancellationToken = default);
+    protected ValueTask SendAsync<T>(string method, T payload, CancellationToken cancellationToken = default);
+    protected ValueTask SendAsync(ReadOnlyMemory<byte> payload, WebSocketMessageType messageType = WebSocketMessageType.Binary, CancellationToken cancellationToken = default);
+
+    // JSON serializer options for the typed SendAsync overloads. Override to wire in a
+    // source-generated JsonTypeInfoResolver for AOT/trim-friendly apps. Cache in a
+    // static readonly field; the property is read on every send.
+    protected virtual JsonSerializerOptions SerializerOptions { get; }
+
 }
+```
+
+**Important — `OnMessageAsync(message)` borrow semantics.** The `message` bytes are borrowed from a per-connection pooled buffer and valid only for the duration of the returned task. Synchronous use (including `await`-points inside the method) is safe. Do **not** capture `message` into `Task.Run`, fire-and-forget continuations, queues, or long-lived state — copy via `message.ToArray()` first if you need to retain the bytes. Most parsers consume the span synchronously and produce their own owned representations — no copy needed for the typical case.
+
+**Recommended deserialization patterns:**
+
+```csharp
+// Best — typed source-generated context (AOT-safe, reflection-free, ~2-3× faster):
+[JsonSerializable(typeof(TwilioEvent))]
+public sealed partial class TwilioInboundJsonContext : JsonSerializerContext { }
+
+var evt = JsonSerializer.Deserialize(message.Span, TwilioInboundJsonContext.Default.TwilioEvent);
+
+// Good — JsonDocument scoped inside OnMessageAsync, zero buffer copies:
+using var doc = JsonDocument.Parse(message);
+var root = doc.RootElement;
+// (use `root` synchronously here; doc is disposed when method returns)
+
+// Also fine — typed reflection-based deserialization:
+var evt = JsonSerializer.Deserialize<TwilioEvent>(message.Span, _options);
+
+// Avoid — copying before parsing (the IVA's pre-borrow pattern); the .ToArray()
+// is now redundant since JsonDocument.Parse accepts ReadOnlySpan<byte> directly:
+using var doc = JsonDocument.Parse(message.ToArray());   // ← unnecessary copy
 ```
 
 | Hook | When | What's available |
@@ -162,10 +198,25 @@ public abstract class WebSocketHandler {
 
 ## Server-initiated push
 
-Inject `IConnectionSender` from inside any `WebSocketHandler` lifecycle hook (or any code running inside the WebSocket invocation pipeline — including Conductor command/query handlers triggered from `OnMessageAsync`) to push to the calling client:
+The framework offers two complementary push APIs. Both send the same wire format and route to the same client; pick the one whose audience matches your code.
+
+### `this.SendAsync(...)` — handler-bound (recommended for handler-internal code)
+
+Three protected overloads on `WebSocketHandler`:
 
 ```csharp
-public sealed class TelemetryHandler(IConnectionSender sender) : WebSocketHandler {
+protected ValueTask SendAsync<T>(T payload, CancellationToken ct = default);
+protected ValueTask SendAsync<T>(string method, T payload, CancellationToken ct = default);
+protected ValueTask SendAsync(
+    ReadOnlyMemory<byte> payload,
+    WebSocketMessageType type = WebSocketMessageType.Binary,
+    CancellationToken ct = default);
+```
+
+Resolves the underlying `WebSocket` directly from `this.Connection` — **no accessor lookup, no AsyncLocal dependency**. Works from any calling context: lifecycle hooks AND handler-managed background tasks (outbound socket receive loops, timers, fire-and-forget continuations).
+
+```csharp
+public sealed class TelemetryHandler : WebSocketHandler {
 
     public override async Task OnMessageAsync(
         IInvocationContext context,
@@ -173,15 +224,45 @@ public sealed class TelemetryHandler(IConnectionSender sender) : WebSocketHandle
         WebSocketMessageType messageType) {
 
         var ack = ComputeAck(message);
-        await sender.SendAsync("Ack", ack, context.Aborted);
+        await SendAsync("Ack", ack, context.Aborted);   // ← handler-bound, no DI
     }
 
 }
 ```
 
-The no-method `SendAsync<T>(payload)` overload JSON-serializes the payload as a Text frame; the keyed `SendAsync<T>(method, payload)` overload wraps the payload in a `{ method, payload }` envelope for apps implementing their own method-dispatch protocol over WebSocket.
+Throws `InvalidOperationException` when called before `Connection` is set (i.e. during `OnAcceptAsync` / `OnSelectSubProtocolAsync` — pre-accept, no socket yet).
 
-`IConnectionSender` is bound to the *active invocation* — it pushes to the connection that delivered the currently-executing message. It is not a general server-to-client push mechanism for arbitrary connections; raw WebSocket has no built-in connection registry (this is a backlog item).
+### `IConnectionSender` — ambient-invocation-aware (for cross-cutting code)
+
+Inject from cross-cutting code that doesn't know what transport invoked it — Conductor command/query handlers, validators, transport-agnostic services. Resolves the active connection through the ambient `IInvocationContextAccessor`, so the same handler code can push back over HTTP, SignalR, or WebSocket without knowing which it's running on:
+
+```csharp
+public sealed class GenerateReportHandler(
+    IInvocationContextAccessor accessor,
+    IConnectionSender sender) : ICommandHandler<GenerateReportCommand> {
+
+    public async ValueTask<Result> Handle(GenerateReportCommand cmd, CancellationToken ct) {
+        var canPush = accessor.Current?.Connection is not null;
+
+        if (canPush) await sender.SendAsync("Progress", new { Percent = 0 }, ct);
+        // ... work ...
+        if (canPush) await sender.SendAsync("Progress", new { Percent = 100 }, ct);
+
+        return Result.Success(/* ... */);
+    }
+
+}
+```
+
+### When to use which
+
+| You're writing | Use | Why |
+|---|---|---|
+| Code inside a `WebSocketHandler` (any lifecycle hook or handler-owned background task) | **`this.SendAsync(...)`** | You have direct access to `Connection`. No need to re-resolve through ambient state. Works regardless of `ExecutionContext` flow. |
+| A Conductor command/query handler that may be invoked from HTTP, SignalR, or WebSocket | **`IConnectionSender`** | The handler doesn't know its transport. The ambient accessor is the seam. |
+| A `BackgroundService`, hosted timer, or queue worker that pushes to specific connections | Neither — see `BACKLOG.md` "Connection registry / fan-out push" | Out of scope for both today (no active invocation, no captured handler reference). |
+
+Both APIs push only to the *currently-executing* connection. Broadcast / group / target-by-id push for raw WebSocket is a future addition (see `BACKLOG.md`); for those patterns today, use SignalR (`Cirreum.Runtime.Invocation.SignalR`) which has them natively via `IHubContext<THub>`.
 
 ## Connection lifecycle (cross-cutting)
 

@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`WebSocketHandler.SendAsync` overloads (3)** — handler-bound push primitives that resolve the underlying `WebSocket` directly from `this.Connection`, bypassing the ambient `IInvocationContextAccessor` lookup. Lets handlers send to the inbound (framework-owned) socket from *any* calling context — lifecycle hooks AND handler-managed background tasks — symmetric with how they already send to handler-owned outbound sockets. Closes a fragility gap in the IVA-style voice/AI bridge pattern where `IConnectionSender` could fail in background tasks whose `ExecutionContext` capture didn't include the synthetic invocation. Three overloads:
+  - `SendAsync<T>(T payload, CancellationToken)` — JSON-serialize as a `Text` frame
+  - `SendAsync<T>(string method, T payload, CancellationToken)` — `{ method, payload }` envelope for method-dispatch protocols, sent as `Text`
+  - `SendAsync(ReadOnlyMemory<byte>, WebSocketMessageType, CancellationToken)` — raw bytes (`Binary` by default), bypasses JSON
+
+  The two typed overloads send `WebSocketMessageType.Text`. `IConnectionSender` is unchanged and remains the right tool for cross-cutting code (Conductor command/query handlers, validators, transport-agnostic services that may run on HTTP, SignalR, or WebSocket). Choose `this.SendAsync` for handler-internal code and `IConnectionSender` for cross-cutting.
+
+- **`WebSocketHandler.SerializerOptions` virtual property** — JSON serializer options used by the typed `SendAsync` overloads. Defaults to reflection-based `JsonSerializerDefaults.Web`. Override to wire in a source-generated `JsonTypeInfoResolver` for AOT/trim-friendly apps and reflection-free runtime serialization. Cache the override in a `static readonly` field — the property is read on every send.
+
+### Changed
+
+- **Inbound frame-loop buffering switched from `MemoryStream` to `ArrayBufferWriter<byte>`** — purpose-built for write-only buffer accumulation, fewer fields touched per `Write`, no per-message `byte[]` allocation. Internal change; not observable from outside the package.
+
+- **`OnMessageAsync(message)` lifetime is now borrow semantics** — the bytes are valid only for the duration of the returned task. After the task completes, the framework reuses the buffer for the next inbound message. Eliminates a per-message `byte[]` allocation in the framework's hot path. Source- and binary-compatible (signature unchanged); semantic change for handlers that captured the memory into `Task.Run`, fire-and-forget continuations, queues, or long-lived state — those must now copy explicitly via `message.ToArray()`. Most parsers (`JsonDocument.Parse`, `MessagePackSerializer.Deserialize`, etc.) consume the span synchronously and need no copy.
+
+### Migration from 1.0.0
+
+If `OnMessageAsync` captures `message` past the returned task's completion, copy explicitly:
+
+```diff
+  public override async Task OnMessageAsync(IInvocationContext context, ReadOnlyMemory<byte> message, WebSocketMessageType type) {
+-     _ = Task.Run(() => SaveAsync(message, context.Aborted));
++     var owned = message.ToArray();
++     _ = Task.Run(() => SaveAsync(owned, context.Aborted));
+  }
+```
+
+Synchronous parsing, awaited dispatch, and direct forwarding over an outbound socket all keep `message` alive long enough — no change needed.
+
 ## [1.0.0] - 2026-05-09
 
 ### Added
