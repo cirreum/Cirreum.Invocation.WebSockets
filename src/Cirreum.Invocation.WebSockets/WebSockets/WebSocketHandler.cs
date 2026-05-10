@@ -4,6 +4,7 @@ using Cirreum.Invocation;
 using Cirreum.Invocation.Connections;
 using Microsoft.AspNetCore.Http;
 using System.Net.WebSockets;
+using System.Security.Claims;
 using System.Text.Json;
 
 /// <summary>
@@ -34,6 +35,38 @@ using System.Text.Json;
 /// </remarks>
 public abstract class WebSocketHandler {
 
+	/// <summary>
+	/// Pre-establishment sentinel for <see cref="Connection"/>. Singleton; one allocation
+	/// per process. Every member throws <see cref="InvalidOperationException"/> with a
+	/// message explaining when the connection becomes valid — calling <see cref="SendAsync{T}(T, CancellationToken)"/>,
+	/// <see cref="IWebSocketConnection.SendBytesAsync"/>, or any state accessor before
+	/// <see cref="OnConnectedAsync"/> runs surfaces a clear diagnostic instead of a
+	/// <see cref="NullReferenceException"/>.
+	/// </summary>
+	private sealed class NotEstablished : IWebSocketConnection {
+
+		public static readonly NotEstablished Instance = new();
+		private NotEstablished() { }
+
+		private static InvalidOperationException Pending() => new(
+			"WebSocketHandler.Connection has not been established yet. " +
+			"Send/Abort operations are valid from OnConnectedAsync through " +
+			"OnDisconnectedAsync; during OnAcceptAsync / OnSelectSubProtocolAsync " +
+			"the connection does not yet exist.");
+
+		public string ConnectionId                           => throw Pending();
+		public ClaimsPrincipal User                          => throw Pending();
+		public DateTimeOffset ConnectedAtUtc                 => throw Pending();
+		public IDictionary<object, object?> Items            => throw Pending();
+		public string InvocationSource                       => throw Pending();
+		public CancellationToken Aborted                     => throw Pending();
+		public void Abort()                                  => throw Pending();
+		public ValueTask SendAsync<T>(T payload, CancellationToken cancellationToken = default) => throw Pending();
+		public ValueTask SendAsync<T>(string method, T payload, CancellationToken cancellationToken = default) => throw Pending();
+		public ValueTask SendBytesAsync(ReadOnlyMemory<byte> bytes, WebSocketMessageType messageType = WebSocketMessageType.Binary, CancellationToken cancellationToken = default) => throw Pending();
+
+	}
+
 	private static readonly JsonSerializerOptions _defaultSerializerOptions = new(JsonSerializerDefaults.Web);
 
 	/// <summary>
@@ -48,6 +81,15 @@ public abstract class WebSocketHandler {
 	/// apps, performance-critical paths (no reflection at runtime), or custom naming/ignore
 	/// policies. Cache the override in a static field so the same instance is returned for
 	/// the connection's lifetime.
+	/// </para>
+	/// <para>
+	/// Read once by the framework at upgrade time and captured on the underlying
+	/// <see cref="IWebSocketConnection"/> — the typed <c>SendAsync&lt;T&gt;</c> overloads on
+	/// the connection use these options too, so cross-cutting code that pushes through
+	/// <c>IInvocationContextAccessor.Current.Connection</c> automatically picks up
+	/// the same serializer (including any source-generated resolver). Overriding the
+	/// property to return different options after the connection is established has no
+	/// effect.
 	/// </para>
 	/// <para>
 	/// Example:
@@ -69,16 +111,28 @@ public abstract class WebSocketHandler {
 	/// </code>
 	/// </para>
 	/// </remarks>
-	protected virtual JsonSerializerOptions SerializerOptions => _defaultSerializerOptions;
+	protected internal virtual JsonSerializerOptions SerializerOptions => _defaultSerializerOptions;
 
 
 	/// <summary>
 	/// The active connection for this handler instance. Set by the framework after the
-	/// WebSocket is accepted, before <see cref="OnConnectedAsync"/> is called.
-	/// <see langword="null"/> during <see cref="OnAcceptAsync"/> and
-	/// <see cref="OnSelectSubProtocolAsync"/> (the connection doesn't exist yet).
+	/// WebSocket is accepted, before <see cref="OnConnectedAsync"/> is called. Backed by a
+	/// throwing sentinel during <see cref="OnAcceptAsync"/> and
+	/// <see cref="OnSelectSubProtocolAsync"/> (the real connection doesn't exist yet) — the
+	/// sentinel surfaces a clear <see cref="InvalidOperationException"/> on any access so
+	/// pre-establishment misuse is loud rather than silent.
 	/// </summary>
-	public IInvocationConnection? Connection { get; internal set; }
+	/// <remarks>
+	/// Typed as <see cref="IWebSocketConnection"/> (which extends
+	/// <see cref="IInvocationConnection"/>) so handler code can call
+	/// <see cref="IWebSocketConnection.SendBytesAsync"/> for raw frame writes (binary
+	/// protocols, audio chunks, pre-serialized payloads) without a cast. Typed JSON
+	/// sends should prefer the <see cref="SendAsync{T}(T, CancellationToken)"/> shortcuts
+	/// on this handler — they forward to the connection's L2
+	/// <see cref="IInvocationConnection.SendAsync{T}(T, CancellationToken)"/> with the
+	/// captured <see cref="SerializerOptions"/>.
+	/// </remarks>
+	public IWebSocketConnection Connection { get; internal set; } = NotEstablished.Instance;
 
 	/// <summary>
 	/// The negotiated WebSocket subprotocol for this connection. Set by the framework
@@ -226,10 +280,12 @@ public abstract class WebSocketHandler {
 
 
 	/// <summary>
-	/// Push a payload to the calling client over the active WebSocket connection as a
-	/// <see cref="WebSocketMessageType.Text"/> frame. JSON-serialization uses
-	/// <see cref="SerializerOptions"/> — override that property to wire in a
-	/// source-generated <c>JsonTypeInfoResolver</c> for AOT/trim-friendly apps.
+	/// Push a typed payload to the calling client over the active connection. Forwards to
+	/// <see cref="IInvocationConnection.SendAsync{T}(T, CancellationToken)"/> on
+	/// <see cref="Connection"/> — the underlying connection holds the captured
+	/// <see cref="SerializerOptions"/> from this handler, so cross-cutting code that
+	/// reaches the same connection through <see cref="IInvocationContextAccessor"/>
+	/// produces identical wire bytes.
 	/// </summary>
 	/// <remarks>
 	/// <para>
@@ -241,12 +297,9 @@ public abstract class WebSocketHandler {
 	/// through the ambient <see cref="IInvocationContextAccessor"/>.
 	/// </para>
 	/// <para>
-	/// Use this for handler-bound push (the typical case for raw WebSocket apps that
-	/// own outbound state and forward responses to the inbound caller). For
-	/// transport-agnostic push from cross-cutting code (Conductor command handlers,
-	/// validators, services that may run under HTTP, SignalR, or WebSocket), inject
-	/// <see cref="IConnectionSender"/> instead — it resolves the active connection
-	/// from the ambient invocation context.
+	/// For raw frame writes (binary protocols, audio, pre-serialized payloads), cast
+	/// <see cref="Connection"/> to <see cref="IWebSocketConnection"/> and call
+	/// <c>SendBytesAsync</c>.
 	/// </para>
 	/// </remarks>
 	/// <typeparam name="T">Payload type.</typeparam>
@@ -254,69 +307,26 @@ public abstract class WebSocketHandler {
 	/// <param name="cancellationToken">Cancellation token for the send.</param>
 	/// <exception cref="InvalidOperationException">
 	/// <see cref="Connection"/> is <see langword="null"/> (called before
-	/// <see cref="OnConnectedAsync"/> or after <see cref="OnDisconnectedAsync"/>).
+	/// <see cref="OnConnectedAsync"/> or after the connection's underlying resources
+	/// have been disposed).
 	/// </exception>
 	protected ValueTask SendAsync<T>(T payload, CancellationToken cancellationToken = default) {
-		var ws = this.ResolveWebSocket();
-		var bytes = JsonSerializer.SerializeToUtf8Bytes(payload, this.SerializerOptions);
-		return ws.SendAsync(
-			bytes.AsMemory(),
-			WebSocketMessageType.Text,
-			endOfMessage: true,
-			cancellationToken);
+		return this.Connection.SendAsync(payload, cancellationToken);
 	}
 
 	/// <summary>
-	/// Push a payload addressed to a specific method/event name as a
-	/// <see cref="WebSocketMessageType.Text"/> frame. Wraps the payload in a
-	/// <c>{ "method": "...", "payload": ... }</c> envelope for apps implementing their
-	/// own method-dispatch protocol over WebSocket. JSON-serialization uses
-	/// <see cref="SerializerOptions"/>.
+	/// Push a typed payload addressed to a specific method/event name. Wraps the payload
+	/// in a <c>{ "method": "...", "payload": ... }</c> JSON envelope (sent as a Text frame)
+	/// for apps implementing their own method-dispatch protocol over WebSocket. Forwards to
+	/// <see cref="IInvocationConnection.SendAsync{T}(string, T, CancellationToken)"/> on
+	/// <see cref="Connection"/>.
 	/// </summary>
 	/// <remarks>
 	/// Same connection-bound semantics as <see cref="SendAsync{T}(T, CancellationToken)"/>
 	/// — works from lifecycle hooks AND background tasks.
 	/// </remarks>
 	protected ValueTask SendAsync<T>(string method, T payload, CancellationToken cancellationToken = default) {
-		ArgumentException.ThrowIfNullOrWhiteSpace(method);
-		var ws = this.ResolveWebSocket();
-		var envelope = new { method, payload };
-		var bytes = JsonSerializer.SerializeToUtf8Bytes(envelope, this.SerializerOptions);
-		return ws.SendAsync(
-			bytes.AsMemory(),
-			WebSocketMessageType.Text,
-			endOfMessage: true,
-			cancellationToken);
-	}
-
-	/// <summary>
-	/// Push raw bytes as a Binary frame. Use for binary protocols (audio, telemetry,
-	/// pre-serialized payloads). Bypasses JSON serialization entirely.
-	/// </summary>
-	/// <remarks>
-	/// Same connection-bound semantics as the typed overloads.
-	/// </remarks>
-	protected ValueTask SendAsync(
-		ReadOnlyMemory<byte> payload,
-		WebSocketMessageType messageType = WebSocketMessageType.Binary,
-		CancellationToken cancellationToken = default) {
-
-		var ws = this.ResolveWebSocket();
-		return ws.SendAsync(
-			payload,
-			messageType,
-			endOfMessage: true,
-			cancellationToken);
-	}
-
-	private WebSocket ResolveWebSocket() {
-		if (this.Connection is not WebSocketConnection wsConnection) {
-			throw new InvalidOperationException(
-				$"WebSocketHandler.SendAsync called before Connection was established. " +
-				$"Connection is null during OnAcceptAsync and OnSelectSubProtocolAsync; " +
-				$"it is set before OnConnectedAsync runs and remains valid through OnDisconnectedAsync.");
-		}
-		return wsConnection.WebSocket;
+		return this.Connection.SendAsync(method, payload, cancellationToken);
 	}
 
 }

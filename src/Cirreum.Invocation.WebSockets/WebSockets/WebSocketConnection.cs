@@ -4,9 +4,10 @@ using Cirreum.Invocation.Connections;
 using Microsoft.Extensions.Logging;
 using System.Net.WebSockets;
 using System.Security.Claims;
+using System.Text.Json;
 
 /// <summary>
-/// <see cref="IInvocationConnection"/> for a single long-lived WebSocket connection.
+/// <see cref="IWebSocketConnection"/> for a single long-lived WebSocket connection.
 /// Wraps ASP.NET's <see cref="WebSocket"/> and the originating HTTP context
 /// as the unified seam for per-connection state.
 /// </summary>
@@ -20,17 +21,28 @@ using System.Security.Claims;
 /// <see cref="IInvocationConnection.Items"/> is a fresh dictionary, distinct from the HTTP context's Items.
 /// Per-connection state set by the handler or framework code flows through here.
 /// </para>
+/// <para>
+/// The typed <c>SendAsync&lt;T&gt;</c> overloads serialize through a captured
+/// <see cref="JsonSerializerOptions"/> instance — sourced from the active
+/// <see cref="WebSocketHandler.SerializerOptions"/> at construction time. This means
+/// cross-cutting code reaching this connection through
+/// <see cref="IInvocationContextAccessor.Current"/> automatically uses the same
+/// serializer the handler is configured with (including any source-generated
+/// <c>JsonTypeInfoResolver</c> the app set up for AOT/trim-friendly apps).
+/// </para>
 /// </remarks>
-internal sealed partial class WebSocketConnection : IInvocationConnection, IAsyncDisposable {
+internal sealed partial class WebSocketConnection : IWebSocketConnection, IAsyncDisposable {
 
 	private readonly CancellationTokenSource _abortCts;
 	private readonly ILogger<WebSocketConnection> _logger;
+	private readonly JsonSerializerOptions _serializerOptions;
 
 	internal WebSocketConnection(
 		string connectionId,
 		ClaimsPrincipal user,
 		WebSocket webSocket,
 		DateTimeOffset connectedAtUtc,
+		JsonSerializerOptions serializerOptions,
 		ILogger<WebSocketConnection> logger,
 		CancellationToken requestAborted) {
 
@@ -38,6 +50,7 @@ internal sealed partial class WebSocketConnection : IInvocationConnection, IAsyn
 		this.User = user;
 		this.WebSocket = webSocket;
 		this.ConnectedAtUtc = connectedAtUtc;
+		this._serializerOptions = serializerOptions;
 		this._logger = logger;
 		this._abortCts = CancellationTokenSource.CreateLinkedTokenSource(requestAborted);
 	}
@@ -62,10 +75,42 @@ internal sealed partial class WebSocketConnection : IInvocationConnection, IAsyn
 		}
 	}
 
+	public ValueTask SendAsync<T>(T payload, CancellationToken cancellationToken = default) {
+		var bytes = JsonSerializer.SerializeToUtf8Bytes(payload, this._serializerOptions);
+		return this.WebSocket.SendAsync(
+			bytes.AsMemory(),
+			WebSocketMessageType.Text,
+			endOfMessage: true,
+			cancellationToken);
+	}
+
+	public ValueTask SendAsync<T>(string method, T payload, CancellationToken cancellationToken = default) {
+		ArgumentException.ThrowIfNullOrWhiteSpace(method);
+		var envelope = new { method, payload };
+		var bytes = JsonSerializer.SerializeToUtf8Bytes(envelope, this._serializerOptions);
+		return this.WebSocket.SendAsync(
+			bytes.AsMemory(),
+			WebSocketMessageType.Text,
+			endOfMessage: true,
+			cancellationToken);
+	}
+
+	public ValueTask SendBytesAsync(
+		ReadOnlyMemory<byte> bytes,
+		WebSocketMessageType messageType = WebSocketMessageType.Binary,
+		CancellationToken cancellationToken = default) {
+
+		return this.WebSocket.SendAsync(
+			bytes,
+			messageType,
+			endOfMessage: true,
+			cancellationToken);
+	}
 
 	/// <summary>
-	/// The underlying WebSocket for sending frames. Used by
-	/// <see cref="WebSocketConnectionSender"/> for server-initiated push.
+	/// The underlying WebSocket. Internal — not exposed on
+	/// <see cref="IWebSocketConnection"/>; use <see cref="SendBytesAsync"/> for raw
+	/// frame writes.
 	/// </summary>
 	internal WebSocket WebSocket { get; }
 

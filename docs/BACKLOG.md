@@ -7,29 +7,17 @@ Deferred work for the WebSocket invocation source. Each item carries SemVer impa
 ### Pluggable serialization providers (MessagePack, Protobuf)
 
 - **SemVer:** Minor
-- **Trigger:** First app needs binary-efficient on-wire format on top of WebSocket; or `IConnectionSender` is shown to be a bottleneck for high-frequency JSON traffic.
-- **Noted:** 2026-05-09
+- **Trigger:** First concrete app need for typed binary-format push (MessagePack, Protobuf, CBOR) over the framework's typed `SendAsync<T>` path.
+- **Noted:** 2026-05-09; reaffirmed 2026-05-09 during `IConnectionSender` consolidation.
 
-The current `WebSocketConnectionSender` always serializes payloads as JSON via `System.Text.Json`. Apps that need binary-efficient formats (MessagePack, Protobuf, CBOR) have to bypass `IConnectionSender` and write to the raw WebSocket.
+The framework's typed `SendAsync<T>` overloads on `IInvocationConnection` (and the handler shortcut) always JSON-serialize via `System.Text.Json` using the handler's captured `SerializerOptions`. Apps that need binary-efficient formats today have an escape hatch: cast to `IWebSocketConnection` and call `SendBytesAsync(myBytes, WebSocketMessageType.Binary, ct)` after serializing themselves with their library of choice (MessagePack-CSharp, protobuf-net, etc.). That works for app-internal code today; what's missing is a *typed* binary path that cross-cutting code (Conductor handlers running under a transport-agnostic abstraction) can use.
 
-Proposed shape:
+Resisting now because:
+- The escape hatch covers app-internal binary code (the common case).
+- A well-shaped abstraction needs a concrete consumer to drive it. Speculating on `IPayloadSerializer` shape (Text vs Binary frame, envelope handling, AOT/source-gen integration) without a real workload risks getting it wrong.
+- gRPC streaming (when added) brings its own typed binary story via Protobuf message types; the abstraction may want to span both transports rather than being WebSocket-specific.
 
-```csharp
-public interface IConnectionSerializer {
-    WebSocketMessageType MessageType { get; }   // Text or Binary
-    void Serialize<T>(T payload, IBufferWriter<byte> writer);
-    void SerializeWithMethod<T>(string method, T payload, IBufferWriter<byte> writer);
-}
-
-// Default: JsonConnectionSerializer (current behavior)
-// Add-on packages:
-//   Cirreum.Invocation.WebSockets.Serialization.MessagePack → MessagePackConnectionSerializer
-//   Cirreum.Invocation.WebSockets.Serialization.Protobuf   → ProtobufConnectionSerializer
-```
-
-`WebSocketConnectionSender` resolves `IConnectionSerializer` from DI; default registration uses `JsonConnectionSerializer`. Per-instance serializer choice via instance settings (`Serializer: "MessagePack"` etc.) or via subprotocol negotiation (e.g. client requests `cirreum-msgpack-v1`, handler returns it from `OnSelectSubProtocolAsync`, framework wires the matching serializer).
-
-Reference: [MessagePack-CSharp](https://github.com/MessagePack-CSharp/MessagePack-CSharp).
+Reaffirm and design when the first real binary-typed-push-from-cross-cutting-code use case shows up. Reference: [MessagePack-CSharp](https://github.com/MessagePack-CSharp/MessagePack-CSharp).
 
 ---
 
@@ -62,37 +50,13 @@ ASP.NET's `WebSocketAcceptContext.DangerousEnableCompression` enables permessage
 
 ---
 
-### Provider-level `WebSocketOptions` configuration
-
-- **SemVer:** Minor
-- **Trigger:** App needs to set global WebSocket options (default `KeepAliveInterval`, `KeepAliveTimeout`, `AllowedOrigins`) at the framework layer rather than calling `app.UseWebSockets(options)` themselves.
-- **Noted:** 2026-05-09
-
-`MapWebSocketInvocation()` currently calls `app.UseWebSockets()` with no arguments. Apps that want to set global `WebSocketOptions` have to call `UseWebSockets(...)` themselves *before* `MapWebSocketInvocation()`. Works, but feels awkward.
-
-Proposed: provider-level config section binding `WebSocketOptions`:
-
-```json
-"Cirreum:Invocation:Providers:WebSocket:WebSocketOptions": {
-  "KeepAliveInterval": "00:02:00",
-  "KeepAliveTimeout": "00:00:30",
-  "AllowedOrigins": ["https://example.com"]
-}
-```
-
-`MapWebSocketInvocation()` reads this and passes to `UseWebSockets()`. Per-instance `KeepAliveInterval` / `KeepAliveTimeout` still override via `WebSocketAcceptContext`.
-
-**On `AllowedOrigins` specifically:** the Origin header is a defense against browser-based CSWSH (Cross-Site WebSocket Hijacking) when the auth model relies on automatically-attached browser credentials (cookies). Cirreum's API-first, stateless, sessionless, cookieless design eliminates this attack surface — token-bearer auth (header or query string) doesn't get auto-attached cross-origin, so a malicious site's JavaScript can't ride a victim's authenticated session. `AllowedOrigins` is therefore a **low-priority** addition for Cirreum apps; included here only for completeness alongside the other `WebSocketOptions` fields. Apps mixing cookie auth and WebSocket should still wire it (via the existing `app.UseWebSockets(...)` escape hatch).
-
----
-
 ### Connection registry / fan-out push
 
 - **SemVer:** Minor
 - **Trigger:** First app needs to broadcast/group-send across active WebSocket connections (e.g. push notifications, presence updates).
 - **Noted:** 2026-05-09
 
-`IConnectionSender` only addresses the calling client. Apps that want to send to *other* connections (broadcast, target by user ID, target by group) need a connection registry. SignalR provides this natively (`Clients.All`, `Clients.User`, `Clients.Group`). Raw WebSocket has no equivalent — apps build it themselves today.
+`IInvocationConnection.SendAsync` (and `IWebSocketConnection.SendBytesAsync`) only address the calling client. Apps that want to send to *other* connections (broadcast, target by user ID, target by group) need a connection registry. SignalR provides this natively (`Clients.All`, `Clients.User`, `Clients.Group`). Raw WebSocket has no equivalent — apps build it themselves today.
 
 Proposed: `IWebSocketConnectionRegistry` with `GetConnections(predicate)` / `SendToAsync(...)`. Maintained by `IConnectionLifecycle.OnConnectedAsync` / `OnDisconnectedAsync` framework hooks. Memory-only by default; pluggable via interface for distributed scenarios (Redis, etc.).
 

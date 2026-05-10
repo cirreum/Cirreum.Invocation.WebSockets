@@ -1,7 +1,6 @@
 namespace Cirreum.Invocation;
 
 using Cirreum.Invocation.Configuration;
-using Cirreum.Invocation.Connections;
 using Cirreum.Invocation.WebSockets;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Builder;
@@ -109,7 +108,6 @@ public sealed class WebSocketInvocationRegistrar
 		IConfiguration configuration) {
 
 		services.TryAddSingleton<WebSocketOrchestrator>();
-		services.TryAddScoped<IConnectionSender, WebSocketConnectionSender>();
 	}
 
 	/// <inheritdoc/>

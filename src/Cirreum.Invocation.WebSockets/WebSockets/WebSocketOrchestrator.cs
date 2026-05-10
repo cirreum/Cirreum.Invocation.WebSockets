@@ -98,6 +98,7 @@ internal sealed partial class WebSocketOrchestrator(
 			httpContext.User,
 			webSocket,
 			timeProvider.GetUtcNow(),
+			handler.SerializerOptions,
 			connectionLogger,
 			cancellationToken);
 

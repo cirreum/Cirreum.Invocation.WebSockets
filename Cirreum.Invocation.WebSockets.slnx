@@ -13,6 +13,7 @@
     <File Path="docs/CHANGELOG.md" />
     <File Path="docs/RELEASE-NOTES-v1.0.0.md" />
     <File Path="docs/RELEASE-NOTES-v1.1.0.md" />
+    <File Path="docs/RELEASE-NOTES-v1.2.0.md" />
   </Folder>
   <Folder Name="/publish/">
     <File Path=".github/workflows/publish.yml" />

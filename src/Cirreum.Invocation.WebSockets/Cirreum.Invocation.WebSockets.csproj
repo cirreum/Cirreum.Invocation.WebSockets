@@ -2,7 +2,7 @@
 
 	<PropertyGroup>
 		<RootNamespace>Cirreum.Invocation</RootNamespace>
-		<Description>WebSocket invocation source for the Cirreum framework — transport adapter that publishes IInvocationContext per WebSocket frame, materializes IInvocationConnection per connection, dispatches IConnectionLifecycle callbacks, and provides IConnectionSender for server-initiated push.</Description>
+		<Description>WebSocket invocation source for the Cirreum framework — transport adapter that publishes IInvocationContext per WebSocket frame, materializes IWebSocketConnection per connection, dispatches IConnectionLifecycle callbacks, and exposes typed-payload server push through IInvocationConnection.SendAsync (or raw frame writes through IWebSocketConnection.SendBytesAsync).</Description>
 		<PackageTags>cirreum;invocation;websocket;providers</PackageTags>
 	</PropertyGroup>
 
@@ -11,7 +11,7 @@
 	</ItemGroup>
 
 	<ItemGroup>
-		<PackageReference Include="Cirreum.InvocationProvider" Version="1.2.0" />
+		<PackageReference Include="Cirreum.InvocationProvider" Version="1.3.0" />
 	</ItemGroup>
 
 </Project>
