@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-05-09
+
 ### Added
 
 - **`WebSocketHandler.SendAsync` overloads (3)** — handler-bound push primitives that resolve the underlying `WebSocket` directly from `this.Connection`, bypassing the ambient `IInvocationContextAccessor` lookup. Lets handlers send to the inbound (framework-owned) socket from *any* calling context — lifecycle hooks AND handler-managed background tasks — symmetric with how they already send to handler-owned outbound sockets. Closes a fragility gap in the IVA-style voice/AI bridge pattern where `IConnectionSender` could fail in background tasks whose `ExecutionContext` capture didn't include the synthetic invocation. Three overloads:
